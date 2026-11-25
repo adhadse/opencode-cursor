@@ -1514,9 +1514,11 @@ function createBridgeStreamResponse(
       // Stall watchdog. Cursor can keep the H2 stream open (so the bridge's idle
       // timer keeps resetting) while producing nothing, and the client would wait
       // forever. End such turns with an explicit error and record which frames
-      // arrived so the cause can be diagnosed. Text, thinking and tool calls count
-      // as progress. Override with CURSOR_PROXY_STALL_MS.
-      const stallMs = Number(process.env.CURSOR_PROXY_STALL_MS) || 240_000;
+      // arrived so the cause can be diagnosed. Any server frame other than a
+      // heartbeat counts as progress, since Cursor can spend a long time streaming
+      // tool-call arguments or working server-side without emitting text.
+      // Override with CURSOR_PROXY_STALL_MS.
+      const stallMs = Number(process.env.CURSOR_PROXY_STALL_MS) || 900_000;
       let lastProgressAt = Date.now();
       const frameCounts: Record<string, number> = {};
       const stallTimer = setInterval(() => {
@@ -1558,6 +1560,7 @@ function createBridgeStreamResponse(
                     ? `interaction:${m.value.message?.case ?? "unknown"}`
                     : (m.case ?? "unknown");
               frameCounts[detail] = (frameCounts[detail] ?? 0) + 1;
+              if (detail !== "interaction:heartbeat") lastProgressAt = Date.now();
             }
             processServerMessage(
               serverMessage,
