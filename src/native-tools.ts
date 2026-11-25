@@ -40,6 +40,11 @@ import {
   WriteSuccessSchema,
   ExecClientControlMessageSchema,
   ExecClientStreamCloseSchema,
+  FetchErrorSchema,
+  GrepErrorSchema,
+  LsErrorSchema,
+  ReadErrorSchema,
+  WriteErrorSchema,
   type ExecServerMessage,
   type LsDirectoryTreeNode,
   type McpToolDefinition,
@@ -273,6 +278,89 @@ interface PendingNativeExec {
  * `sendMessage` receives an unframed AgentClientMessage binary.
  */
 export function sendNativeExecResult(
+  exec: PendingNativeExec,
+  binding: NativeExecBinding,
+  text: string,
+  sendMessage: (bytes: Uint8Array) => void,
+): boolean {
+  // Cursor waits indefinitely for a result of the exact native type it asked
+  // for; a generic mcpResult (or silence) leaves the turn hung until the stall
+  // watchdog fires. So every native exec gets a typed reply, even when the
+  // client tool's output can't be converted faithfully.
+  try {
+    if (sendNativeExecResultInner(exec, binding, text, sendMessage)) return true;
+  } catch (err) {
+    console.error(
+      `[cursor-oauth] native result conversion failed (${binding.resultType}): ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  return sendNativeExecError(exec, binding, text, sendMessage);
+}
+
+/** Reply to a native exec with its own typed error result carrying `text`. */
+export function sendNativeExecError(
+  exec: PendingNativeExec,
+  binding: NativeExecBinding,
+  text: string,
+  sendMessage: (bytes: Uint8Array) => void,
+): boolean {
+  const args = binding.args ?? {};
+  const sendExec = (messageCase: string, value: unknown) => {
+    const execClientMessage = create(ExecClientMessageSchema, {
+      id: exec.execMsgId,
+      execId: exec.execId,
+      message: { case: messageCase as never, value: value as never },
+    });
+    sendMessage(
+      toBinary(
+        AgentClientMessageSchema,
+        create(AgentClientMessageSchema, {
+          message: { case: "execClientMessage", value: execClientMessage },
+        }),
+      ),
+    );
+  };
+
+  switch (binding.resultType) {
+    case "readResult":
+      sendExec("readResult", create(ReadResultSchema, { result: { case: "error", value: create(ReadErrorSchema, { path: args.path ?? "", error: text }) } }));
+      return true;
+    case "writeResult":
+      sendExec("writeResult", create(WriteResultSchema, { result: { case: "error", value: create(WriteErrorSchema, { path: args.path ?? "", error: text }) } }));
+      return true;
+    case "fetchResult":
+      sendExec("fetchResult", create(FetchResultSchema, { result: { case: "error", value: create(FetchErrorSchema, { url: args.url ?? "", error: text }) } }));
+      return true;
+    case "lsResult":
+      sendExec("lsResult", create(LsResultSchema, { result: { case: "error", value: create(LsErrorSchema, { path: args.path ?? "", error: text }) } }));
+      return true;
+    case "grepResult":
+      sendExec("grepResult", create(GrepResultSchema, { result: { case: "error", value: create(GrepErrorSchema, { error: text }) } }));
+      return true;
+    case "shellResult":
+      sendExec(
+        "shellResult",
+        create(ShellResultSchema, {
+          result: {
+            case: "success",
+            value: create(ShellSuccessSchema, {
+              command: args.command ?? "",
+              workingDirectory: args.workingDirectory ?? "",
+              exitCode: 1,
+              signal: "",
+              stdout: "",
+              stderr: text,
+            }),
+          },
+        }),
+      );
+      return true;
+    default:
+      return false;
+  }
+}
+
+function sendNativeExecResultInner(
   exec: PendingNativeExec,
   binding: NativeExecBinding,
   text: string,
@@ -546,7 +634,13 @@ function buildGrepResult(content: string, args: Record<string, string>) {
 
   // Non-empty tool output that we failed to parse: better to hand the raw
   // text back as an mcpResult than to claim "no matches".
-  if (content.trim() && isEmptyGrepUnion(unionResult)) return null;
+  if (
+    content.trim() &&
+    isEmptyGrepUnion(unionResult) &&
+    !/^(No files found|No matches found)/i.test(content.trim())
+  ) {
+    return null;
+  }
 
   return create(GrepResultSchema, {
     result: {
@@ -595,7 +689,12 @@ function buildGrepFilesResult(content: string, clientTruncated: boolean) {
   const files = content
     .split("\n")
     .map((line) => line.replace(/\r$/, "").trim())
-    .filter(Boolean);
+    .filter(
+      (line) =>
+        line &&
+        !/^(No files found|No matches found|Found \d+ )/i.test(line) &&
+        !/^\(.*\)$/.test(line),
+    );
 
   return {
     case: "files" as const,
@@ -627,6 +726,37 @@ function buildGrepContentResult(content: string, clientTruncated: boolean) {
   for (const rawLine of content.split("\n")) {
     const line = rawLine.replace(/\r$/, "");
     if (line === "--" || line === "") continue;
+
+    // OpenCode's grep tool format:
+    //   Found N matches
+    //   /abs/file:
+    //     Line 12: matched text
+    if (
+      /^(Found \d+ matches?|No files found|No matches found)\b/i.test(line) ||
+      /^\(.*(truncated|more).*\)$/i.test(line)
+    ) {
+      continue;
+    }
+    const ocLine = line.match(/^\s+Line (\d+): ?(.*)$/);
+    if (ocLine && currentFile) {
+      totalLines += 1;
+      totalMatchedLines += 1;
+      currentMatches.push(
+        create(GrepContentMatchSchema, {
+          lineNumber: Number.parseInt(ocLine[1]!, 10),
+          content: ocLine[2]!,
+          contentTruncated: false,
+          isContextLine: false,
+        }),
+      );
+      continue;
+    }
+    const ocFile = line.match(/^(\S.*):$/);
+    if (ocFile) {
+      flushFile();
+      currentFile = ocFile[1]!;
+      continue;
+    }
 
     const matchLine = line.match(/^(.+?):(\d+):(.*)/);
     if (matchLine) {

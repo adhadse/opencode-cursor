@@ -1,8 +1,9 @@
 import http from "node:http";
 import http2 from "node:http2";
 import type { AddressInfo } from "node:net";
-import { create, toBinary } from "@bufbuild/protobuf";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
+  AgentClientMessageSchema,
   GetUsableModelsResponseSchema,
   ModelDetailsSchema,
 } from "../src/proto/agent_pb";
@@ -918,6 +919,51 @@ async function testNativeRedirectSchemas() {
   console.log("[test] Native redirect schemas OK");
 }
 
+async function testNativeResultsAlwaysTyped() {
+  const { sendNativeExecResult, sendNativeExecError } = await import("../src/native-tools");
+  const exec = { execMsgId: 1, execId: "e1" } as never;
+  const send = (binding: unknown, text: string, fn = sendNativeExecResult) => {
+    const out: Uint8Array[] = [];
+    fn(exec, binding as never, text, (b) => out.push(b));
+    return out.map((b) => {
+      const m = fromBinary(AgentClientMessageSchema, b).message;
+      const em = (m.value as { message: { case?: string; value?: unknown } }).message;
+      return { case: em.case, value: em.value as { result?: { case?: string; value?: any } } };
+    });
+  };
+  const grep = (outputMode: string, extra: object = {}) =>
+    ({ resultType: "grepResult", args: { pattern: "x", path: "/p", outputMode, ...extra } });
+
+  // OpenCode's grep output format parses into structured matches.
+  const parsed = send(grep("content"), "Found 3 matches\n/p/c.txt:\n  Line 1: bye\n  Line 7: foo:12:bar\n\n/p/d.txt:\n  Line 3: bye bye");
+  assertEqual(parsed[0]!.value.result!.case, "success", "grep success");
+  const union = parsed[0]!.value.result!.value.workspaceResults["/p"].result.value;
+  assertEqual(union.matches.length, 2, "grep file count");
+  assertEqual(union.totalMatchedLines, 3, "grep matched lines");
+  assertEqual(union.matches[0].matches[1].content, "foo:12:bar", "grep content with colons");
+
+  // "No files found" is a valid empty result, not an unparseable one.
+  assertEqual(send(grep("content"), "No files found")[0]!.value.result!.case, "success", "empty grep");
+  assertEqual(send(grep("files_with_matches"), "No files found")[0]!.value.result!.value.workspaceResults["/p"].result.value.files.length, 0, "empty glob");
+
+  // Unparseable output must still get a typed grepResult (never an mcpResult),
+  // otherwise Cursor waits forever.
+  for (const [name, b, text] of [
+    ["grep garbage", grep("content"), "ripgrep exploded"],
+    ["grep multiline", grep("content", { multiline: "true" }), "whatever"],
+    ["read", { resultType: "readResult", args: { path: "/p/a" } }, "hello"],
+    ["write", { resultType: "writeResult", args: { path: "/p/a" } }, "ok"],
+    ["ls", { resultType: "lsResult", args: { path: "/p" } }, ""],
+    ["shell", { resultType: "shellResult", args: { command: "ls" } }, "out"],
+  ] as const) {
+    const msgs = send(b, text);
+    assert(msgs.length > 0 && msgs.every((m) => m.case !== "mcpResult"), `${name}: typed native reply`);
+  }
+  assertEqual(send(grep("content"), "ripgrep exploded")[0]!.value.result!.case, "error", "unparseable grep -> typed error");
+  assertEqual(send(grep("content"), "missing", sendNativeExecError)[0]!.case, "grepResult", "missing result -> typed error");
+  console.log("✓ native results are always typed");
+}
+
 async function main() {
   const backend = await createTestCursorBackend();
   process.env.CURSOR_API_URL = backend.apiUrl;
@@ -934,6 +980,7 @@ async function main() {
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);
     await testNativeRedirectSchemas();
+    await testNativeResultsAlwaysTyped();
     await testV2Plugin(modules, backend);
     console.log("\n✓ All smoke tests passed");
     process.exitCode = 0;

@@ -70,6 +70,7 @@ import {
 } from "./proto/agent_pb";
 import {
   redirectNativeExec,
+  sendNativeExecError,
   sendNativeExecResult,
   type NativeExecBinding,
 } from "./native-tools";
@@ -1518,7 +1519,7 @@ function createBridgeStreamResponse(
       // heartbeat counts as progress, since Cursor can spend a long time streaming
       // tool-call arguments or working server-side without emitting text.
       // Override with CURSOR_PROXY_STALL_MS.
-      const stallMs = Number(process.env.CURSOR_PROXY_STALL_MS) || 900_000;
+      const stallMs = Number(process.env.CURSOR_PROXY_STALL_MS) || 240_000;
       let lastProgressAt = Date.now();
       const frameCounts: Record<string, number> = {};
       const stallTimer = setInterval(() => {
@@ -1745,10 +1746,13 @@ function handleToolResultResume(
       text += `\n\n<user_message>\n${userText}\n</user_message>`;
     }
 
-    if (result && exec.native) {
-      const sent = sendNativeExecResult(exec, exec.native, text, (bytes) =>
-        bridge.write(frameConnectMessage(bytes)),
-      );
+    if (exec.native) {
+      // Native execs must be answered with their own typed result (never an
+      // mcpResult) or Cursor waits forever.
+      const write = (bytes: Uint8Array) => bridge.write(frameConnectMessage(bytes));
+      const sent = result
+        ? sendNativeExecResult(exec, exec.native, text, write)
+        : sendNativeExecError(exec, exec.native, text, write);
       if (sent) continue;
     }
 
