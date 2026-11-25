@@ -188,9 +188,28 @@ function normalizeSingleModel(model: unknown): CursorModel | null {
     id,
     name: pickDisplayName(details, id),
     reasoning: Boolean(details.thinkingDetails),
-    contextWindow: DEFAULT_CONTEXT_WINDOW,
+    contextWindow: parseContextWindow(details) ?? DEFAULT_CONTEXT_WINDOW,
     maxTokens: DEFAULT_MAX_TOKENS,
   };
+}
+
+/**
+ * Cursor's model list carries no context-window field, but it tags long-context
+ * models in the display name (e.g. "Claude Opus 5.5 1M High"). Read that tag so
+ * OpenCode doesn't treat a 1M model as 200k.
+ */
+export function parseContextWindow(
+  model: Pick<CursorModelDetails, "displayName" | "displayNameShort" | "displayModelId" | "aliases">,
+): number | undefined {
+  const names = [model.displayName, model.displayNameShort, model.displayModelId, ...model.aliases];
+  for (const name of names) {
+    if (typeof name !== "string") continue;
+    const match = name.match(/(?:^|\s)(\d+(?:\.\d+)?)\s*([MK])(?=\s|$)/i);
+    if (!match) continue;
+    const value = Number(match[1]) * (match[2]!.toUpperCase() === "M" ? 1_000_000 : 1_000);
+    if (Number.isFinite(value) && value >= 8_000) return Math.round(value);
+  }
+  return undefined;
 }
 
 function pickDisplayName(model: CursorModelDetails, fallbackId: string): string {

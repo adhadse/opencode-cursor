@@ -964,6 +964,20 @@ async function testNativeResultsAlwaysTyped() {
   console.log("✓ native results are always typed");
 }
 
+async function testContextWindowFromDisplayName() {
+  const { parseContextWindow } = await import("../src/models");
+  const w = (displayName: string) =>
+    parseContextWindow({ displayName, displayNameShort: "", displayModelId: "", aliases: [] });
+  assertEqual(w("Claude Opus 5.5 1M"), 1_000_000, "1M tag");
+  assertEqual(w("Claude Opus 5.5 1M High Fast"), 1_000_000, "1M tag with variant");
+  assertEqual(w("Model 272K"), 272_000, "K tag");
+  assertEqual(w("GPT-5.4 1.5M"), 1_500_000, "fractional M tag");
+  assertEqual(w("Claude Sonnet 5.5  Medium"), undefined, "no tag");
+  assertEqual(w("Gemini 3.5 Flash"), undefined, "no tag (flash)");
+  assertEqual(w("Composer 2.5"), undefined, "version number is not a size");
+  console.log("✓ context window parsed from display name");
+}
+
 async function main() {
   const backend = await createTestCursorBackend();
   process.env.CURSOR_API_URL = backend.apiUrl;
@@ -981,6 +995,7 @@ async function main() {
     await testDiscoveryFallbackAndSuccess(modules, backend);
     await testNativeRedirectSchemas();
     await testNativeResultsAlwaysTyped();
+    await testContextWindowFromDisplayName();
     await testV2Plugin(modules, backend);
     console.log("\n✓ All smoke tests passed");
     process.exitCode = 0;
