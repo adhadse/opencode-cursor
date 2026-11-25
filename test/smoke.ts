@@ -978,6 +978,28 @@ async function testContextWindowFromDisplayName() {
   console.log("✓ context window parsed from display name");
 }
 
+async function testParallelToolCallsDelivered() {
+  const { createToolCallsResponse } = await import("../src/proxy");
+  const execs = [
+    { execId: "e2", execMsgId: 2, toolCallId: "call_2", toolName: "shell", decodedArgs: '{"command":"echo hi"}' },
+    { execId: "e3", execMsgId: 3, toolCallId: "call_3", toolName: "grep", decodedArgs: '{"pattern":"x"}' },
+  ];
+  const res = createToolCallsResponse(execs as never, "claude-test");
+  const body = await res.text();
+  const events = body
+    .split("\n\n")
+    .filter((l) => l.startsWith("data: ") && l !== "data: [DONE]")
+    .map((l) => JSON.parse(l.slice(6)));
+  const calls = events.flatMap((e) => e.choices[0].delta.tool_calls ?? []);
+  assertEqual(calls.length, 2, "both late parallel calls delivered");
+  assertEqual(calls[0].id, "call_2", "first late call id");
+  assertEqual(calls[1].index, 1, "second late call index");
+  assertEqual(calls[1].function.name, "grep", "second late call name");
+  assertEqual(events[events.length - 1].choices[0].finish_reason, "tool_calls", "finish reason");
+  assert(body.trimEnd().endsWith("data: [DONE]"), "stream terminated");
+  console.log("✓ late parallel tool calls are delivered to the client");
+}
+
 async function main() {
   const backend = await createTestCursorBackend();
   process.env.CURSOR_API_URL = backend.apiUrl;
@@ -996,6 +1018,7 @@ async function main() {
     await testNativeRedirectSchemas();
     await testNativeResultsAlwaysTyped();
     await testContextWindowFromDisplayName();
+    await testParallelToolCallsDelivered();
     await testV2Plugin(modules, backend);
     console.log("\n✓ All smoke tests passed");
     process.exitCode = 0;

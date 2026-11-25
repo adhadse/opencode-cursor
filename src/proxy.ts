@@ -83,6 +83,15 @@ import { z } from "zod";
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
 const BRIDGE_PATH = pathResolve(import.meta.dir, "h2-bridge.mjs");
+// Frames Cursor sends while it is alive but producing nothing the user can see.
+const IDLE_FRAMES = new Set([
+  "interaction:heartbeat",
+  "interaction:tokenDelta",
+  "interaction:toolCallCompleted",
+  "interaction:stepCompleted",
+  "conversationCheckpointUpdate",
+  "kvServerMessage",
+]);
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
   "Cache-Control": "no-cache",
@@ -146,6 +155,22 @@ interface PendingExec {
   decodedArgs: string;
   /** Set when this exec is a redirected native tool call (issue #21/#29). */
   native?: NativeExecBinding;
+  /**
+   * False when the exec arrived after the response that carried the first
+   * tool call was already closed (Cursor emits parallel calls a few hundred ms
+   * apart). Such calls are handed to the client on its next request instead of
+   * being answered with a fake result.
+   */
+  delivered?: boolean;
+}
+
+/** A replacement connection started when the current one goes silent. */
+interface RestartedBridge {
+  bridge: ReturnType<typeof spawnBridge>;
+  heartbeatTimer: NodeJS.Timeout;
+  blobStore: Map<string, Uint8Array>;
+  mcpTools: McpToolDefinition[];
+  cloudRule?: string;
 }
 
 /** A bridge kept alive across requests for tool result continuation. */
@@ -555,12 +580,35 @@ async function handleChatCompletion(
   const convKey = deriveConversationKey(body.messages);
   const activeBridge = activeBridges.get(bridgeKey);
 
+  // Starts a brand-new bridge from the full conversation history. Used to
+  // recover when the connection to Cursor goes completely silent.
+  const restart = async (): Promise<RestartedBridge> => {
+    let st = conversationStates.get(convKey);
+    if (!st) {
+      st = (await loadPersistedConversation(convKey)) ?? {
+        conversationId: deterministicUuid(`cursor-conv-id:${convKey}`),
+        checkpoint: null,
+        blobStore: new Map(),
+        lastAccessMs: Date.now(),
+      };
+      conversationStates.set(convKey, st);
+    }
+    st.lastAccessMs = Date.now();
+    const p = buildCursorRequest(
+      modelId, systemPrompts, userText, history,
+      st.conversationId, st.checkpoint, st.blobStore,
+    );
+    p.mcpTools = buildMcpToolDefinitions(tools);
+    const started = startBridge(accessToken, p.requestBytes);
+    return { ...started, blobStore: p.blobStore, mcpTools: p.mcpTools, cloudRule: p.cloudRule };
+  };
+
   if (activeBridge && toolResults.length > 0) {
     activeBridges.delete(bridgeKey);
 
     if (activeBridge.bridge.alive) {
       // Resume the live bridge with tool results
-      return handleToolResultResume(activeBridge, toolResults, userText, modelId, bridgeKey, convKey);
+      return handleToolResultResume(activeBridge, toolResults, userText, modelId, bridgeKey, convKey, restart);
     }
 
     // Bridge died (timeout, server disconnect, etc.).
@@ -603,7 +651,7 @@ async function handleChatCompletion(
   if (body.stream === false) {
     return handleNonStreamingResponse(payload, accessToken, modelId, convKey);
   }
-  return handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey);
+  return handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey, restart);
 }
 
 interface ToolResultInfo {
@@ -1448,14 +1496,15 @@ function deterministicUuid(seed: string): string {
 
 /** Create an SSE streaming Response that reads from a live bridge. */
 function createBridgeStreamResponse(
-  bridge: ReturnType<typeof spawnBridge>,
-  heartbeatTimer: NodeJS.Timeout,
-  blobStore: Map<string, Uint8Array>,
-  mcpTools: McpToolDefinition[],
-  cloudRule: string | undefined,
+  bridge0: ReturnType<typeof spawnBridge>,
+  heartbeatTimer0: NodeJS.Timeout,
+  blobStore0: Map<string, Uint8Array>,
+  mcpTools0: McpToolDefinition[],
+  cloudRule0: string | undefined,
   modelId: string,
   bridgeKey: string,
   convKey: string,
+  restart?: () => Promise<RestartedBridge>,
 ): Response {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
@@ -1464,6 +1513,12 @@ function createBridgeStreamResponse(
     start(controller) {
       const encoder = new TextEncoder();
       let closed = false;
+      // Mutable so a silent connection can be swapped for a fresh one.
+      let bridge = bridge0;
+      let heartbeatTimer = heartbeatTimer0;
+      let blobStore = blobStore0;
+      let mcpTools = mcpTools0;
+      let cloudRule = cloudRule0;
       const sendSSE = (data: object) => {
         if (closed) return;
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
@@ -1476,6 +1531,7 @@ function createBridgeStreamResponse(
         if (closed) return;
         closed = true;
         clearInterval(stallTimer);
+        clearInterval(silentTimer);
         controller.close();
       };
 
@@ -1522,6 +1578,56 @@ function createBridgeStreamResponse(
       const stallMs = Number(process.env.CURSOR_PROXY_STALL_MS) || 240_000;
       let lastProgressAt = Date.now();
       const frameCounts: Record<string, number> = {};
+      // Cursor normally answers within a couple of seconds. A connection that
+      // goes quiet (no activity beyond heartbeats/bookkeeping) before anything
+      // reached the client is dead or stuck, e.g. after a plugin reload or a
+      // black-holed route, so replace it instead of waiting out the full stall
+      // timeout. Retrying is safe because no text or tool call has been sent.
+      const silentRetryMs = Number(process.env.CURSOR_PROXY_SILENT_RETRY_MS) || 60_000;
+      const maxSilentRetries = 2;
+      let silentRetries = 0;
+      let lastActivityAt = Date.now();
+      let emitted = false;
+      let retrying = false;
+      const silentTimer = setInterval(async () => {
+        if (closed || retrying || !restart || emitted || mcpExecReceived || silentRetries >= maxSilentRetries) return;
+        if (Date.now() - lastActivityAt < silentRetryMs) return;
+        retrying = true;
+        silentRetries++;
+        const line = `[cursor-oauth] silent connection (no activity for ${Math.round((Date.now() - lastActivityAt) / 1000)}s, frames=${JSON.stringify(frameCounts)}) model=${modelId}; retry ${silentRetries}/${maxSilentRetries} on a fresh connection`;
+        console.error(line);
+        appendFile(
+          pathResolve(homedir(), ".cache", "opencode-cursor", "stall.log"),
+          `${new Date().toISOString()} ${line}\n`,
+        ).catch(() => {});
+        const old = bridge;
+        try {
+          const fresh = await restart();
+          if (closed) {
+            clearInterval(fresh.heartbeatTimer);
+            fresh.bridge.end();
+            return;
+          }
+          clearInterval(heartbeatTimer);
+          bridge = fresh.bridge;
+          heartbeatTimer = fresh.heartbeatTimer;
+          blobStore = fresh.blobStore;
+          mcpTools = fresh.mcpTools;
+          cloudRule = fresh.cloudRule;
+          activeBridges.delete(bridgeKey);
+          old.end();
+          lastActivityAt = Date.now();
+          lastProgressAt = Date.now();
+          for (const k of Object.keys(frameCounts)) delete frameCounts[k];
+          wire(bridge);
+        } catch (err) {
+          console.error(`[cursor-oauth] silent-connection retry failed: ${err instanceof Error ? err.message : String(err)}`);
+          silentRetries = maxSilentRetries;
+        } finally {
+          retrying = false;
+        }
+      }, 5_000);
+
       const stallTimer = setInterval(() => {
         if (closed || Date.now() - lastProgressAt < stallMs) return;
         clearInterval(stallTimer);
@@ -1562,6 +1668,7 @@ function createBridgeStreamResponse(
                     : (m.case ?? "unknown");
               frameCounts[detail] = (frameCounts[detail] ?? 0) + 1;
               if (detail !== "interaction:heartbeat") lastProgressAt = Date.now();
+              if (!IDLE_FRAMES.has(detail)) lastActivityAt = Date.now();
             }
             processServerMessage(
               serverMessage,
@@ -1572,6 +1679,7 @@ function createBridgeStreamResponse(
               state,
               (text, isThinking) => {
                 lastProgressAt = Date.now();
+                emitted = true;
                 if (isThinking) {
                   sendSSE(makeChunk({ reasoning_content: text }));
                 } else {
@@ -1583,6 +1691,10 @@ function createBridgeStreamResponse(
               // onMcpExec — the model wants to execute a tool.
               (exec) => {
                 lastProgressAt = Date.now();
+                // Cursor emits parallel tool calls a few hundred ms apart, but this
+                // response ends at the first one. Later calls are kept and handed
+                // to the client on its next request (see handleToolResultResume).
+                exec.delivered = !closed;
                 state.pendingExecs.push(exec);
                 mcpExecReceived = true;
 
@@ -1654,9 +1766,16 @@ function createBridgeStreamResponse(
         },
       );
 
-      bridge.onData(processChunk);
+      const wire = (b: ReturnType<typeof spawnBridge>) => {
+        b.onData((data) => {
+          if (b === bridge) processChunk(data);
+        });
+        b.onClose((code) => {
+          if (b === bridge) onBridgeClose(code);
+        });
+      };
 
-      bridge.onClose((code) => {
+      const onBridgeClose = (code: number) => {
         clearInterval(heartbeatTimer);
         const stored = conversationStates.get(convKey);
         if (stored) {
@@ -1683,7 +1802,8 @@ function createBridgeStreamResponse(
           // Remove stale entry so the next request doesn't try to resume it.
           activeBridges.delete(bridgeKey);
         }
-      });
+      };
+      wire(bridge);
     },
   });
 
@@ -1710,12 +1830,13 @@ function handleStreamingResponse(
   modelId: string,
   bridgeKey: string,
   convKey: string,
+  restart?: () => Promise<RestartedBridge>,
 ): Response {
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
   return createBridgeStreamResponse(
     bridge, heartbeatTimer,
     payload.blobStore, payload.mcpTools, payload.cloudRule,
-    modelId, bridgeKey, convKey,
+    modelId, bridgeKey, convKey, restart,
   );
 }
 
@@ -1727,13 +1848,16 @@ function handleToolResultResume(
   modelId: string,
   bridgeKey: string,
   convKey: string,
+  restart?: () => Promise<RestartedBridge>,
 ): Response {
   const { bridge, heartbeatTimer, blobStore, mcpTools, cloudRule, pendingExecs } = active;
 
   // Answer each pending exec with a matching tool result: redirected native
   // execs get their typed native result frame, MCP execs get an mcpResult.
-  const lastExecId = pendingExecs[pendingExecs.length - 1]?.execId;
-  for (const exec of pendingExecs) {
+  const toAnswer = pendingExecs.filter((e) => e.delivered !== false);
+  const undelivered = pendingExecs.filter((e) => e.delivered === false);
+  const lastExecId = toAnswer[toAnswer.length - 1]?.execId;
+  for (const exec of toAnswer) {
     const result = toolResults.find(
       (r) => r.toolCallId === exec.toolCallId,
     );
@@ -1798,11 +1922,46 @@ function handleToolResultResume(
     );
   }
 
+  if (undelivered.length > 0) {
+    // Parallel calls the client never saw: hand them over now, keep the bridge
+    // parked, and let the client's results for them resume Cursor later.
+    pendingExecs.splice(0, pendingExecs.length, ...undelivered);
+    for (const e of undelivered) e.delivered = true;
+    activeBridges.set(bridgeKey, { bridge, heartbeatTimer, blobStore, mcpTools, cloudRule, pendingExecs });
+    return createToolCallsResponse(undelivered, modelId);
+  }
+
   return createBridgeStreamResponse(
     bridge, heartbeatTimer,
     blobStore, mcpTools, cloudRule,
-    modelId, bridgeKey, convKey,
+    modelId, bridgeKey, convKey, restart,
   );
+}
+
+/** SSE response that only delivers already-received tool calls to the client. @internal exported for tests */
+export function createToolCallsResponse(execs: PendingExec[], modelId: string): Response {
+  const id = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
+  const created = Math.floor(Date.now() / 1000);
+  const chunk = (delta: object, finish: string | null = null) => ({
+    id,
+    object: "chat.completion.chunk",
+    created,
+    model: modelId,
+    choices: [{ index: 0, delta, finish_reason: finish }],
+  });
+  const lines = execs.map((exec, index) =>
+    chunk({
+      tool_calls: [{
+        index,
+        id: exec.toolCallId,
+        type: "function",
+        function: { name: exec.toolName, arguments: exec.decodedArgs },
+      }],
+    }),
+  );
+  lines.push(chunk({}, "tool_calls"));
+  const body = lines.map((l) => `data: ${JSON.stringify(l)}\n\n`).join("") + "data: [DONE]\n\n";
+  return new Response(new TextEncoder().encode(body), { headers: SSE_HEADERS });
 }
 
 async function handleNonStreamingResponse(
