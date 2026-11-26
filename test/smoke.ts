@@ -1000,6 +1000,28 @@ async function testParallelToolCallsDelivered() {
   console.log("✓ late parallel tool calls are delivered to the client");
 }
 
+async function testOpencodeMcpRouting() {
+  const { withPlanModeMcpNote, OPENCODE_ROUTING_NOTE } = await import("../src/proxy");
+  const plan =
+    "<system-update>\nYou are in Plan mode. Do not modify any other files.\n</system-update>";
+  const out = withPlanModeMcpNote([
+    { role: "system", content: "sys" },
+    { role: "user", content: plan },
+    { role: "user", content: [{ type: "text", text: plan }] as never },
+    { role: "user", content: "Look up ERA-1" },
+  ]);
+  const planTexts = [out[1]!.content as string, (out[2]!.content as { text: string }[])[0]!.text];
+  for (const t of planTexts) {
+    assert(t.includes("`execute`") && t.endsWith("</system-update>"), "plan-mode note added inside the system-update block");
+  }
+  assertEqual(out[0]!.content, "sys", "system message untouched");
+  assertEqual(out[3]!.content, "Look up ERA-1", "ordinary user message untouched");
+  const again = withPlanModeMcpNote(out);
+  assertEqual(again[1]!.content, out[1]!.content, "plan-mode note is idempotent");
+  assert(OPENCODE_ROUTING_NOTE.includes("execute") && OPENCODE_ROUTING_NOTE.includes("Plan mode"), "routing note mentions execute and Plan mode");
+  console.log("✓ OpenCode MCP routing notes");
+}
+
 async function main() {
   const backend = await createTestCursorBackend();
   process.env.CURSOR_API_URL = backend.apiUrl;
@@ -1019,6 +1041,7 @@ async function main() {
     await testNativeResultsAlwaysTyped();
     await testContextWindowFromDisplayName();
     await testParallelToolCallsDelivered();
+    await testOpencodeMcpRouting();
     await testV2Plugin(modules, backend);
     console.log("\n✓ All smoke tests passed");
     process.exitCode = 0;

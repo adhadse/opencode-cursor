@@ -83,6 +83,51 @@ import { z } from "zod";
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
 const BRIDGE_PATH = pathResolve(import.meta.dir, "h2-bridge.mjs");
+/**
+ * Cursor models route tool calls through Cursor's own dynamic-tool layer and
+ * assume MCP servers are configured inside Cursor, so they conclude they have
+ * no Jira/Confluence/etc. access (notably under Plan mode). Tell them where the
+ * MCP servers configured in OpenCode actually are.
+ */
+export const OPENCODE_ROUTING_NOTE = [
+  "# Tool routing in this environment",
+  "- Your real tools are provided by OpenCode and appear in the `opencode` dynamic tool namespace (list them with GetDynamicTools, call them with CallDynamicTool). Cursor's own MCP settings and the `cursor` namespace are not where this environment's integrations live.",
+  "- MCP servers configured in OpenCode (for example atlassian/Jira/Confluence, SigNoz, chrome-devtools, and any others named in the instructions above) are NOT separate dynamic tool namespaces and are NOT configured in Cursor. When an `execute` tool is available, it is the only way to reach them: call `execute` with JavaScript such as `return await tools.<server>.<tool>({...})`, and use `await search({ query: '...' })` inside it to discover a server's tools and signatures.",
+  "- Never tell the user to connect an MCP integration in Cursor, to paste content, or to use a browser or curl for something an OpenCode MCP server can read. Try `execute` first.",
+  "- Plan mode only forbids modifying files and state. Read-only MCP lookups (fetching a Jira issue, searching Confluence, reading logs or metrics) are allowed and expected in Plan mode.",
+].join("\n");
+
+const PLAN_MODE_MCP_NOTE =
+  "Read-only lookups through OpenCode's `execute` tool (Jira, Confluence, logs, metrics and other MCP servers: `return await tools.<server>.<tool>({...})`) do not modify anything and are allowed and expected in Plan mode. Use `execute` for them instead of telling the user to fetch the information themselves.";
+
+/** Clarify, inside OpenCode's Plan-mode instruction itself, that read-only MCP access is allowed. */
+export function withPlanModeMcpNote(messages: OpenAIMessage[]): OpenAIMessage[] {
+  const patch = (text: string) =>
+    /You are in Plan mode/i.test(text) &&
+    text.includes("</system-update>") &&
+    !text.includes(PLAN_MODE_MCP_NOTE)
+      ? text.replace("</system-update>", `${PLAN_MODE_MCP_NOTE}\n</system-update>`)
+      : text;
+  return messages.map((m) => {
+    if (m.role !== "user") return m;
+    if (typeof m.content === "string") {
+      const next = patch(m.content);
+      return next === m.content ? m : { ...m, content: next };
+    }
+    if (Array.isArray(m.content)) {
+      return {
+        ...m,
+        content: m.content.map((part) =>
+          part?.type === "text" && typeof part.text === "string"
+            ? { ...part, text: patch(part.text) }
+            : part,
+        ),
+      };
+    }
+    return m;
+  });
+}
+
 // Frames Cursor sends while it is alive but producing nothing the user can see.
 const IDLE_FRAMES = new Set([
   "interaction:heartbeat",
@@ -558,7 +603,12 @@ async function handleChatCompletion(
   body: ChatCompletionRequest,
   accessToken: string,
 ): Promise<Response> {
-  const { systemPrompts, userText, history, toolResults } = parseMessages(body.messages);
+  const hasExecuteTool = (body.tools ?? []).some((t) => t.function?.name === "execute");
+  const messages = hasExecuteTool ? withPlanModeMcpNote(body.messages) : body.messages;
+  const { systemPrompts, userText, history, toolResults } = parseMessages(messages);
+  if (hasExecuteTool && !systemPrompts.includes(OPENCODE_ROUTING_NOTE)) {
+    systemPrompts.push(OPENCODE_ROUTING_NOTE);
+  }
   const modelId = body.model;
   const tools = body.tools ?? [];
 
